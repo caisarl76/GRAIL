@@ -137,6 +137,7 @@ Initialize with:
 
    installation
    quick_start
+   real_robot_validation
 
 .. toctree::
    :maxdepth: 2

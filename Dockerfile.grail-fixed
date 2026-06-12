@@ -1,0 +1,16 @@
+FROM docker.io/nvgrail/grail:latest
+
+RUN printf "/lib\n/usr/local/lib\n/usr/lib\n" > /etc/ld-musl-x86_64.path
+
+ENV LD_LIBRARY_PATH=/lib:/usr/lib:/usr/local/nvidia/lib:/usr/local/nvidia/lib64
+
+RUN LD_LIBRARY_PATH=/lib:/usr/lib apk update && \
+    LD_LIBRARY_PATH=/lib:/usr/lib apk add --no-cache \
+    bash coreutils gcompat libc6-compat file binutils && \
+    ln -sf /bin/busybox /usr/local/bin/sleep && \
+    ln -sf /usr/bin/bash /usr/local/bin/bash
+
+ENV PATH=/usr/local/bin:/workspace/grail/.venv/bin:/usr/local/nvidia/bin:/usr/local/cuda/bin:/usr/local/sbin:/usr/bin:/sbin:/bin
+
+WORKDIR /workspace/grail
+CMD ["/bin/busybox", "sleep", "1200"]

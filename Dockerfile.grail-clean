@@ -1,0 +1,42 @@
+FROM ubuntu:22.04
+
+ENV DEBIAN_FRONTEND=noninteractive
+ENV CUDA_HOME=/usr/local/cuda
+ENV PATH=/opt/conda/bin:/usr/local/cuda/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
+ENV LD_LIBRARY_PATH=/usr/local/cuda/lib64:/usr/local/nvidia/lib:/usr/local/nvidia/lib64
+
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    ca-certificates wget curl gnupg git git-lfs unzip ffmpeg \
+    build-essential cmake g++ gcc pkg-config \
+    libeigen3-dev libboost-all-dev gosu xvfb \
+    libegl1-mesa-dev libgl1-mesa-glx libglib2.0-0 \
+    libxrender1 libxi6 libxkbcommon-x11-0 libsm6 libxext6 \
+    libosmesa6-dev mesa-utils-extra \
+    && rm -rf /var/lib/apt/lists/*
+
+RUN wget -q https://developer.download.nvidia.com/compute/cuda/repos/ubuntu2204/x86_64/cuda-keyring_1.1-1_all.deb -O /tmp/cuda-keyring.deb && \
+    dpkg -i /tmp/cuda-keyring.deb && \
+    rm /tmp/cuda-keyring.deb && \
+    apt-get update && apt-get install -y --no-install-recommends cuda-toolkit-12-8 && \
+    rm -rf /var/lib/apt/lists/*
+
+RUN wget -q https://repo.anaconda.com/miniconda/Miniconda3-latest-Linux-x86_64.sh -O /tmp/miniconda.sh && \
+    bash /tmp/miniconda.sh -b -p /opt/conda && \
+    rm /tmp/miniconda.sh && \
+    conda tos accept --override-channels --channel https://repo.anaconda.com/pkgs/main && \
+    conda tos accept --override-channels --channel https://repo.anaconda.com/pkgs/r && \
+    conda init bash && \
+    conda create -y -n grail python=3.10
+
+RUN conda run -n grail pip install --upgrade pip setuptools wheel && \
+    conda run -n grail pip install torch torchvision torchaudio --index-url https://download.pytorch.org/whl/cu128
+
+ENV PYOPENGL_PLATFORM=egl
+ENV EGL_PLATFORM=surfaceless
+ENV NVIDIA_VISIBLE_DEVICES=all
+ENV NVIDIA_DRIVER_CAPABILITIES=all
+ENV OMNI_KIT_ACCEPT_EULA=Yes
+ENV PRIVACY_CONSENT=Y
+
+WORKDIR /workspace/grail
+CMD ["/bin/bash"]

@@ -10,8 +10,8 @@
 #   PULL_LFS=0 bash scripts/setup/install_env_sonic.sh                 # skip git-lfs pull
 #
 # What this script does, in order:
-#   -1. (INSTALL_SYSTEM_DEPS=1 — default when apt+sudo/root are available)
-#       Install vulkan/GUI libs + git-lfs via apt. Uses sudo if needed;
+#   -1. (INSTALL_SYSTEM_DEPS=1 — default when apt/apk+sudo/root are available)
+#       Install vulkan/GUI libs + git-lfs via apt or apk. Uses sudo if needed;
 #       no-op if we're neither root nor have sudo.
 #   0. (BOOTSTRAP_SONIC=1 — default) Create the conda env with Python 3.11,
 #      pip-install Isaac Sim 5.1.0 (`isaacsim[all,extscache]`), clone Isaac
@@ -20,10 +20,11 @@
 #      editable, and install `vector_quantize_pytorch`. Set BOOTSTRAP_SONIC=0
 #      to skip when you already have an env with IsaacLab/IsaacSim installed
 #      (e.g. gearenv).
-#   1. Applies NVIDIA GMR overrides from grail/retargeting/gmr_overrides/
-#      on top of the public YanjieZe/GMR submodule (idempotent — safe to rerun).
+#   1. Applies optional NVIDIA GMR overrides from grail/retargeting/gmr_overrides/
+#      when present (idempotent — safe to rerun).
 #   2. Symlinks data/motion_lib_genhoi + models into imports/SONIC/gear_sonic/.
-#   3. pip install -e imports/GMR + imports/SONIC/gear_sonic[training]
+#   3. pip install --no-deps -e imports/GMR + install
+#      imports/SONIC/gear_sonic[training,data_collection]
 #      + GRAIL package (editable) + huggingface_hub.
 #   4. pip install retargeting-specific deps (smplx, mujoco, pxr, trimesh, ...).
 #   5. Sanity-imports the top-level modules.
@@ -47,29 +48,61 @@ echo ">>> Target conda env: ${ENV_NAME}"
 echo ">>> Repo root:        ${REPO_ROOT}"
 echo ">>> Bootstrap mode:   ${BOOTSTRAP_SONIC} (1=install Isaac Sim/Lab, 0=assume present)"
 
-# --- Step -1: system deps (Vulkan/GUI/git-lfs) via apt ------------------
-# Idempotent: re-installs are a fast pass. Skipped entirely on non-apt
-# systems or when we can't elevate.
-if [[ "${INSTALL_SYSTEM_DEPS}" == "1" ]] && command -v apt-get &>/dev/null; then
+# --- Step -1: system deps (Vulkan/GUI/git-lfs) --------------------------
+# Idempotent: re-installs are a fast pass. Skipped entirely when no supported
+# package manager can execute or when we can't elevate.
+can_run_command() {
+    command -v "$1" &>/dev/null && "$1" --version &>/dev/null
+}
+
+if [[ "${INSTALL_SYSTEM_DEPS}" == "1" ]]; then
     APT_PKGS=(
         libvulkan1 vulkan-tools mesa-vulkan-drivers
         libxcb-xfixes0 libxcb-cursor0 libxrandr2 libxi6 libxcursor1
-        libxtst6 libxss1 libxrender1 libgl1 libegl1
-        git-lfs rsync
+        libxt6 libxtst6 libxss1 libxrender1 libgl1 libegl1 libglu1-mesa
+        ffmpeg git-lfs rsync
     )
-    if [[ "$(id -u)" -eq 0 ]]; then
-        APT_CMD="apt-get"
-    elif sudo -n true 2>/dev/null; then
-        APT_CMD="sudo apt-get"
+    APK_PKGS=(
+        vulkan-loader vulkan-tools mesa-vulkan-swrast
+        libxcb xcb-util-cursor libxrandr libxi libxcursor
+        libxt libxtst libxscrnsaver libxrender mesa-gl mesa-egl mesa-glu
+        ffmpeg git-lfs rsync
+    )
+
+    if can_run_command apt-get; then
+        if [[ "$(id -u)" -eq 0 ]]; then
+            APT_CMD=(apt-get)
+        elif command -v sudo &>/dev/null && sudo -n true 2>/dev/null; then
+            APT_CMD=(sudo apt-get)
+        else
+            APT_CMD=()
+            echo ">>> [skip apt] not root and no passwordless sudo; install these manually if missing:"
+            echo "    ${APT_PKGS[*]}"
+        fi
+        if [[ ${#APT_CMD[@]} -gt 0 ]]; then
+            echo ">>> Installing system deps via ${APT_CMD[*]} (Vulkan, GUI, git-lfs)"
+            "${APT_CMD[@]}" update -qq
+            "${APT_CMD[@]}" install -y --no-install-recommends "${APT_PKGS[@]}" | tail -3
+        fi
+    elif can_run_command apk; then
+        if [[ "$(id -u)" -eq 0 ]]; then
+            APK_CMD=(apk)
+        elif command -v sudo &>/dev/null && sudo -n true 2>/dev/null; then
+            APK_CMD=(sudo apk)
+        else
+            APK_CMD=()
+            echo ">>> [skip apk] not root and no passwordless sudo; install these manually if missing:"
+            echo "    ${APK_PKGS[*]}"
+        fi
+        if [[ ${#APK_CMD[@]} -gt 0 ]]; then
+            echo ">>> Installing system deps via ${APK_CMD[*]} (Vulkan, GUI, git-lfs)"
+            "${APK_CMD[@]}" update
+            "${APK_CMD[@]}" add --no-cache "${APK_PKGS[@]}" | tail -3
+        fi
     else
-        APT_CMD=""
-        echo ">>> [skip apt] not root and no passwordless sudo; install these manually if missing:"
-        echo "    ${APT_PKGS[*]}"
-    fi
-    if [[ -n "${APT_CMD}" ]]; then
-        echo ">>> Installing system deps via ${APT_CMD} (Vulkan, GUI, git-lfs)"
-        ${APT_CMD} update -qq
-        ${APT_CMD} install -y --no-install-recommends "${APT_PKGS[@]}" | tail -3
+        echo ">>> [skip system deps] no runnable apt-get or apk found; install these manually if missing:"
+        echo "    apt: ${APT_PKGS[*]}"
+        echo "    apk: ${APK_PKGS[*]}"
     fi
 fi
 
@@ -79,7 +112,8 @@ eval "$(conda shell.bash hook)"
 if [[ "${BOOTSTRAP_SONIC}" == "1" ]]; then
     if ! conda env list | awk '{print $1}' | grep -qx "${ENV_NAME}"; then
         echo ">>> Creating conda env '${ENV_NAME}' with Python 3.11"
-        conda create -y -n "${ENV_NAME}" python=3.11
+        # Avoid Anaconda default-channel ToS prompts in non-interactive containers.
+        conda create -y -n "${ENV_NAME}" -c conda-forge --override-channels python=3.11
     fi
     conda activate "${ENV_NAME}"
 
@@ -107,7 +141,7 @@ if [[ "${BOOTSTRAP_SONIC}" == "1" ]]; then
     # setuptools 81+ removed. PEP 517 build isolation installs the latest
     # setuptools, so the wheel build fails. Pin setuptools<81 in the env
     # first, then build flatdict against it.
-    pip install 'setuptools<81' wheel
+    pip install 'setuptools<81' 'wheel==0.44.0' 'packaging==23.0'
     pip install 'flatdict==4.0.1' --no-build-isolation
 
     if [[ ! -d "${ISAAC_LAB_DIR}" ]]; then
@@ -142,25 +176,33 @@ if [[ ! -d "${GMR_DIR}/general_motion_retargeting" ]]; then
     exit 1
 fi
 
-# --- Step 1: apply NVIDIA GMR overrides ---------------------------------
-echo ">>> Applying GMR overrides: ${OVERRIDES} -> ${GMR_DIR}"
-rsync -a --exclude='README.md' "${OVERRIDES}/" "${GMR_DIR}/"
+# --- Step 1: apply optional NVIDIA GMR overrides ------------------------
+if [[ -d "${OVERRIDES}" ]]; then
+    echo ">>> Applying GMR overrides: ${OVERRIDES} -> ${GMR_DIR}"
+    rsync -a --exclude='README.md' "${OVERRIDES}/" "${GMR_DIR}/"
+else
+    echo ">>> [skip GMR overrides] optional directory not found: ${OVERRIDES}"
+fi
 
 # --- Step 2: surface data/ and models/ into the SONIC submodule ---------
 # imports/SONIC/gear_sonic/ is the cwd for training scripts; it expects
 # data/motion_lib_genhoi/... and models/... to resolve from there.
 GEAR_SONIC="${REPO_ROOT}/imports/SONIC/gear_sonic"
-mkdir -p "${REPO_ROOT}/data/motion_lib_genhoi" "${REPO_ROOT}/models"
+mkdir -p "${REPO_ROOT}/data/motion_lib_genhoi" "${REPO_ROOT}/imports/SONIC/models"
 ln -sfn ../../../../data/motion_lib_genhoi "${GEAR_SONIC}/data/motion_lib_genhoi"
-ln -sfn ../../../models "${GEAR_SONIC}/models"
-echo ">>> Linked ${GEAR_SONIC}/{data/motion_lib_genhoi,models} -> repo root"
+ln -sfn ../models "${GEAR_SONIC}/models"
+echo ">>> Linked ${GEAR_SONIC}/data/motion_lib_genhoi -> repo data/"
+echo ">>> Linked ${GEAR_SONIC}/models -> imports/SONIC/models/"
 
 # --- Step 3: editable installs ------------------------------------------
-echo ">>> pip install -e imports/GMR"
-pip install -e "${GMR_DIR}"
+echo ">>> pip install -e imports/GMR (--no-deps; deps pinned below)"
+pip install --no-deps -e "${GMR_DIR}"
 
-echo ">>> pip install -e imports/SONIC/gear_sonic[training] + huggingface_hub"
-pip install -e "${GEAR_SONIC}[training]"
+echo ">>> pip install -e imports/SONIC/gear_sonic[training,data_collection] + huggingface_hub"
+# data_collection provides the LeRobot v2.1 exporter stack used by
+# grail.cli.export_ego_lerobot. Skip LeRobot's LFS test artifacts during the
+# git dependency clone; they are not needed for dataset writing.
+GIT_LFS_SKIP_SMUDGE=1 pip install -e "${GEAR_SONIC}[training,data_collection]"
 pip install huggingface_hub
 
 echo ">>> pip install -e . (grail, --no-deps)"
@@ -174,16 +216,28 @@ pip install --no-deps -e "${REPO_ROOT}"
 # --- Step 4: retargeting-specific deps ----------------------------------
 echo ">>> pip install retargeting deps"
 pip install \
+    'numpy==1.26.4' \
     'smplx @ git+https://github.com/vchoutas/smplx' \
     joblib \
     trimesh \
     usd-core \
-    scipy \
+    'scipy==1.15.3' \
     rich \
     tqdm \
     mujoco \
-    mink \
     'qpsolvers[proxqp]' \
+    loop_rate_limiters \
+    natsort \
+    'redis[hiredis]' \
+    'imageio[ffmpeg]' \
+    protobuf
+
+# GMR needs mink, but current mink metadata asks for qpsolvers[daqp] and pulls
+# daqp>=0.8.2. Isaac Lab 2.3.2 pins daqp==0.7.2, and GRAIL retargeting uses
+# proxqp through qpsolvers, so install mink without letting it rewrite daqp.
+pip install --no-deps mink
+
+pip install \
     'simple-raycaster @ git+https://github.com/Agent-3154/simple-raycaster.git@197daa6dcb146c5ce3e675a173328e17df6b9777'
 
 # --- Step 4b: SONIC training/eval-callback deps -------------------------
@@ -197,8 +251,34 @@ pip install \
 # pip-from-git automatically because the package's setup.py doesn't always
 # install_requires them — list them explicitly.
 pip install \
-    numpy-stl easydict gymnasium mediapy torchgeometry vtk \
+    'numpy==1.26.4' numpy-stl easydict gymnasium mediapy torchgeometry vtk
+
+# gear_sonic.utils.motion_lib.torch_humanoid_batch imports open3d during
+# IsaacLab checkpoint eval. It is currently listed in SONIC's sim requirements
+# but not in the training extra, so install it explicitly for pnp eval.
+pip install 'open3d==0.19.0'
+
+# SMPLSim's setup metadata advertises a broad numpy dependency and pulls numpy
+# 2.x in fresh envs. Install its runtime deps explicitly above, then keep the
+# editable package boundary dependency-free.
+pip install --no-deps \
+    'smplx @ git+https://github.com/ZhengyiLuo/smplx.git@master'
+pip install --no-deps \
     'smpl_sim @ git+https://github.com/ZhengyiLuo/SMPLSim.git'
+
+# Re-run a final repair pass because Isaac Lab/Isaac Sim, GEAR-SONIC, and the
+# retargeting stack carry incompatible metadata ranges. The actual runtime
+# target is NumPy 1.26.x for Isaac/SONIC ABI compatibility, with 1.26.4 chosen
+# because gear_sonic pins it exactly.
+echo ">>> Restoring Isaac/SONIC compatibility pins"
+pip install \
+    'numpy==1.26.4' \
+    'packaging==23.0' \
+    'psutil==5.9.8' \
+    'click==8.4.1' \
+    'daqp==0.7.2' \
+    'opencv-python==4.11.0.86'
+pip install --index-url https://download.pytorch.org/whl/cu128 'torchaudio==2.7.0'
 
 # --- Step 6: git-lfs pull for SONIC assets ------------------------------
 # Mesh STLs + policy ONNX files are LFS-tracked. Without this pull, the
@@ -223,9 +303,40 @@ fi
 
 # --- Sanity checks -------------------------------------------------------
 echo ">>> Verifying install"
+python - <<'PY'
+import importlib.metadata as md
+
+expected_exact = {
+    "numpy": "1.26.4",
+    "packaging": "23.0",
+    "psutil": "5.9.8",
+    "click": "8.4.1",
+    "daqp": "0.7.2",
+    "opencv-python": "4.11.0.86",
+}
+
+for package, expected in expected_exact.items():
+    actual = md.version(package)
+    if actual != expected:
+        raise SystemExit(f"{package}=={actual}; expected {expected}")
+
+torchaudio = md.version("torchaudio")
+if torchaudio.split("+", 1)[0] != "2.7.0":
+    raise SystemExit(f"torchaudio=={torchaudio}; expected 2.7.0")
+
+print("  pinned packages: OK")
+PY
 python -c "import general_motion_retargeting as gmr; print(f'  GMR: {gmr.__file__}')"
 python -c "from grail.retargeting.retarget import main; print('  grail.retargeting.retarget: OK')"
 python -c "import smplx, mujoco; print('  smplx, mujoco: OK')"
+python -c "import open3d; print('  open3d: OK')"
+python -c "import wandb; print('  wandb: OK')"
+python - <<'PY'
+from lerobot.common.datasets.lerobot_dataset import LeRobotDataset
+from gear_sonic.data.exporter import Gr00tDataExporter
+
+print("  LeRobot data exporter: OK")
+PY
 if [[ "${BOOTSTRAP_SONIC}" == "1" ]]; then
     OMNI_KIT_ACCEPT_EULA=Yes python -c "import isaaclab, isaacsim; print('  isaaclab + isaacsim: OK')"
 fi

@@ -30,6 +30,14 @@ from pathlib import Path
 
 import numpy as np
 
+from grail.vla.ego_camera import (
+    DEFAULT_OAK_D_COLOR_FOCAL_LENGTH,
+    DEFAULT_OAK_D_COLOR_HORIZONTAL_APERTURE,
+    EgoCameraSpec,
+    compute_ego_camera_view,
+)
+from grail.vla.episode import VLAFrame
+
 # Per-motion progress heartbeat. Updated before each motion and each frame.
 # A watchdog thread force-exits the process if no heartbeat for WATCHDOG_TIMEOUT
 # seconds, so a hung USD load / sim step can't stall the job indefinitely.
@@ -61,6 +69,59 @@ def start_watchdog():
     t = threading.Thread(target=_watchdog_loop, daemon=True, name="render-watchdog")
     t.start()
     return t
+
+
+def _prepare_rgb_frame(rgb, motion_key: str):
+    frame = np.asarray(rgb)
+    if frame.ndim == 4 and frame.shape[0] == 1:
+        frame = frame[0]
+    if frame.ndim != 3 or frame.shape[2] not in (3, 4):
+        raise RuntimeError(
+            f"Camera RGB for {motion_key} has invalid shape {frame.shape}; "
+            "IsaacSim renderer likely failed before producing image frames. "
+            "Check the Kit log for missing libXt.so.6/libGLU.so.1 and install "
+            "libxt6 libglu1-mesa in the container."
+        )
+    if frame.shape[2] == 4:
+        frame = frame[..., :3]
+    return frame
+
+
+def _overview_camera_pinhole_kwargs() -> dict[str, object]:
+    return {
+        "focal_length": 5.0,
+        "focus_distance": 100.0,
+        "horizontal_aperture": 10.0,
+        "clipping_range": (0.1, 500.0),
+    }
+
+
+def _ego_camera_pinhole_kwargs() -> dict[str, object]:
+    return {
+        "focal_length": DEFAULT_OAK_D_COLOR_FOCAL_LENGTH,
+        "focus_distance": 100.0,
+        "horizontal_aperture": DEFAULT_OAK_D_COLOR_HORIZONTAL_APERTURE,
+        "clipping_range": (0.1, 500.0),
+    }
+
+
+def _ego_camera_eye_target(
+    root_position: np.ndarray,
+    root_quaternion_wxyz: np.ndarray,
+    ego_camera_spec: EgoCameraSpec,
+    frame_index: int,
+) -> tuple[np.ndarray, np.ndarray]:
+    frame = VLAFrame(
+        frame_index=frame_index,
+        timestamp=0.0,
+        joint_position=np.zeros(0, dtype=np.float32),
+        root_position=np.asarray(root_position, dtype=np.float32),
+        root_quaternion_wxyz=np.asarray(root_quaternion_wxyz, dtype=np.float32),
+        object_position=np.zeros(3, dtype=np.float32),
+        object_quaternion_wxyz=np.array([1.0, 0.0, 0.0, 0.0], dtype=np.float32),
+    )
+    view = compute_ego_camera_view(frame, ego_camera_spec)
+    return view.eye.astype(np.float32), view.target.astype(np.float32)
 
 
 def reconstruct_filter_keys(metrics, render_sort_by="obj_pos_error"):
@@ -176,6 +237,7 @@ def render_all(
     camera_target=(0.0, 0.0, 0.8),
     headless=True,
     start_frame_skip=0,
+    ego_camera_spec: EgoCameraSpec | None = None,
 ):
     """Render all trajectories with a single IsaacSim session."""
     import imageio
@@ -254,16 +316,16 @@ def render_all(
 
     # ---- Camera ----
     w, h = resolution
+    pinhole_kwargs = (
+        _ego_camera_pinhole_kwargs()
+        if ego_camera_spec is not None
+        else _overview_camera_pinhole_kwargs()
+    )
     camera_cfg = CameraCfg(
-        prim_path="/World/OverviewCamera",
+        prim_path="/World/EgoCamera" if ego_camera_spec is not None else "/World/OverviewCamera",
         offset=CameraCfg.OffsetCfg(pos=camera_offset, rot=(1, 0, 0, 0), convention="world"),
         data_types=["rgb"],
-        spawn=sim_utils.PinholeCameraCfg(
-            focal_length=5.0,
-            focus_distance=100.0,
-            horizontal_aperture=10.0,
-            clipping_range=(0.1, 500.0),
-        ),
+        spawn=sim_utils.PinholeCameraCfg(**pinhole_kwargs),
         width=w,
         height=h,
     )
@@ -657,12 +719,23 @@ def render_all(
                                     l_tr = leg_xf.AddTranslateOp()
                                 l_tr.Set(Gf.Vec3d(lx, ly, leg_height / 2.0))
 
+                if ego_camera_spec is not None:
+                    ego_eye, ego_target = _ego_camera_eye_target(
+                        root_position=root_pos,
+                        root_quaternion_wxyz=root_quat_f,
+                        ego_camera_spec=ego_camera_spec,
+                        frame_index=f,
+                    )
+                    eye = torch.tensor([ego_eye.tolist()], dtype=torch.float32, device=cam_device)
+                    tgt = torch.tensor([ego_target.tolist()], dtype=torch.float32, device=cam_device)
+                    camera.set_world_poses_from_view(eye, tgt)
+
                 # Step and capture
                 sim.forward()
                 sim.render()
                 camera.update(dt=0.0)
                 rgb = camera.data.output["rgb"][0].cpu().numpy()
-                writer.append_data(rgb)
+                writer.append_data(_prepare_rgb_frame(rgb, motion_key))
 
             writer.close()
             succeeded += 1

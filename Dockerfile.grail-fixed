@@ -1,16 +1,39 @@
-FROM docker.io/nvgrail/grail:latest
+ARG GRAIL_BASE_IMAGE=nvidia/cuda:12.8.1-cudnn-devel-ubuntu22.04
+FROM ${GRAIL_BASE_IMAGE}
 
-RUN printf "/lib\n/usr/local/lib\n/usr/lib\n" > /etc/ld-musl-x86_64.path
+ENV DEBIAN_FRONTEND=noninteractive
+ENV MINIFORGE_URL=https://github.com/conda-forge/miniforge/releases/latest/download/Miniforge3-Linux-x86_64.sh
+ENV PATH=/root/miniconda3/condabin:/root/miniconda3/bin:/workspace/grail/.venv/bin:/usr/local/nvidia/bin:/usr/local/cuda/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
 
-ENV LD_LIBRARY_PATH=/lib:/usr/lib:/usr/local/nvidia/lib:/usr/local/nvidia/lib64
-
-RUN LD_LIBRARY_PATH=/lib:/usr/lib apk update && \
-    LD_LIBRARY_PATH=/lib:/usr/lib apk add --no-cache \
-    bash coreutils gcompat libc6-compat file binutils && \
-    ln -sf /bin/busybox /usr/local/bin/sleep && \
-    ln -sf /usr/bin/bash /usr/local/bin/bash
-
-ENV PATH=/usr/local/bin:/workspace/grail/.venv/bin:/usr/local/nvidia/bin:/usr/local/cuda/bin:/usr/local/sbin:/usr/bin:/sbin:/bin
+RUN apt-get update -qq && \
+    apt-get install -y --no-install-recommends \
+    bash \
+    ca-certificates \
+    curl \
+    bzip2 \
+    ffmpeg \
+    git \
+    git-lfs \
+    rsync \
+    build-essential \
+    cmake \
+    pkg-config \
+    libvulkan1 vulkan-tools mesa-vulkan-drivers \
+    libxcb-xfixes0 libxcb-cursor0 libxrandr2 libxi6 libxcursor1 \
+    libxt6 libxtst6 libxss1 libxrender1 libgl1 libegl1 libglu1-mesa \
+    libglib2.0-0 libsm6 libxext6 libxkbcommon-x11-0 && \
+    curl -fsSL "${MINIFORGE_URL}" -o /tmp/miniforge.sh && \
+    bash /tmp/miniforge.sh -b -p /root/miniconda3 && \
+    rm -f /tmp/miniforge.sh && \
+    (conda config --system --remove-key channels || true) && \
+    conda config --system --add channels conda-forge && \
+    conda config --system --set channel_priority strict && \
+    conda config --system --set auto_activate_base false && \
+    conda --version && \
+    conda clean -afy && \
+    git lfs install --system && \
+    apt-get clean && \
+    rm -rf /var/lib/apt/lists/*
 
 WORKDIR /workspace/grail
-CMD ["/bin/busybox", "sleep", "1200"]
+CMD ["/bin/bash"]

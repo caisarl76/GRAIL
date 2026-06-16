@@ -2,7 +2,6 @@ import os
 import queue
 import sys
 import threading
-import time
 
 import av
 import numpy as np
@@ -26,12 +25,14 @@ class VideoWriter:
             os.makedirs(output_dir, exist_ok=True)
 
         self.queue = queue.Queue(maxsize=buffer_size)
+        self._closed = False
+        self._worker_error = None
         self.container = av.open(output_path, mode="w")
         self.stream = self.container.add_stream(codec, rate=fps)
         self.stream.width = width
         self.stream.height = height
-        thread = threading.Thread(target=self._writer_worker, daemon=True)
-        thread.start()
+        self.thread = threading.Thread(target=self._writer_worker, daemon=True)
+        self.thread.start()
 
     def _assert_dimensions(self, frame: np.ndarray) -> None:
         assert (
@@ -42,35 +43,45 @@ class VideoWriter:
         )
 
     def add_frame(self, frame: np.ndarray) -> None:
+        if self._closed:
+            raise RuntimeError("Cannot add frames after VideoWriter.stop()")
         self._assert_dimensions(frame)
         self.queue.put(frame)
 
     def _writer_worker(self) -> None:
         while True:
             frame = self.queue.get()
-            if frame is None:
-                continue
-            self._assert_dimensions(frame)
-            frame = av.VideoFrame.from_ndarray(frame, format="rgb24")
+            try:
+                if frame is None:
+                    return
+                if self._worker_error is not None:
+                    continue
 
-            if self._first_frame:
-                stderr_fd = sys.stderr.fileno()
-                old_stderr = os.dup(stderr_fd)
-                devnull = os.open(os.devnull, os.O_WRONLY)
-                os.dup2(devnull, stderr_fd)
-                try:
+                self._assert_dimensions(frame)
+                frame = av.VideoFrame.from_ndarray(frame, format="rgb24")
+
+                if self._first_frame:
+                    stderr_fd = sys.stderr.fileno()
+                    old_stderr = os.dup(stderr_fd)
+                    devnull = os.open(os.devnull, os.O_WRONLY)
+                    os.dup2(devnull, stderr_fd)
+                    try:
+                        packets = self.stream.encode(frame)
+                        for packet in packets:
+                            self.container.mux(packet)
+                    finally:
+                        os.dup2(old_stderr, stderr_fd)
+                        os.close(old_stderr)
+                        os.close(devnull)
+                        self._first_frame = False
+                else:
                     packets = self.stream.encode(frame)
                     for packet in packets:
                         self.container.mux(packet)
-                finally:
-                    os.dup2(old_stderr, stderr_fd)
-                    os.close(old_stderr)
-                    os.close(devnull)
-                    self._first_frame = False
-            else:
-                packets = self.stream.encode(frame)
-                for packet in packets:
-                    self.container.mux(packet)
+            except BaseException as exc:
+                self._worker_error = exc
+            finally:
+                self.queue.task_done()
 
     def _flush_stream(self) -> None:
         packets = self.stream.encode()
@@ -79,10 +90,15 @@ class VideoWriter:
 
     def stop(self) -> str:
         """Blocking call. Waits for queue to drain, flushes, and closes the container."""
-        if not self.queue.empty():
-            print("Waiting for video writer queue to empty...")
-            while not self.queue.empty():
-                time.sleep(0.1)
+        self._closed = True
+        self.queue.put(None)
+        print("Waiting for video writer queue to empty...")
+        self.queue.join()
+        self.thread.join()
+
+        if self._worker_error is not None:
+            self.container.close()
+            raise self._worker_error
 
         print("Video writer queue is empty, flushing stream...")
         self._flush_stream()

@@ -377,7 +377,7 @@ class MotionLibBase:
         # BPS (Basis Point Set) object shape encoding
         # bps_dir: path to a folder of per-object <stem>.npy files + _basis.npy
         self._bps_lookup: dict = {}  # object_stem -> (d,) np.ndarray
-        self._bps_dim: int = 0
+        self._bps_dim: int = int(motion_lib_cfg.get("bps_dim", 0) or 0)
         bps_dir = motion_lib_cfg.get("bps_dir", None)
         if bps_dir is not None and osp.isdir(bps_dir):
             import numpy as _bps_np  # noqa: PLC0415
@@ -389,7 +389,12 @@ class MotionLibBase:
                 self._bps_dim = next(iter(self._bps_lookup.values())).shape[0]
             logger.info(f"[BPS] Loaded {len(self._bps_lookup)} objects, dim={self._bps_dim} from {bps_dir}/")
         elif bps_dir is not None:
-            logger.warning(f"[BPS] bps_dir not found: {bps_dir} — BPS obs will be zeros")
+            if self._bps_dim > 0:
+                logger.warning(
+                    f"[BPS] bps_dir not found: {bps_dir} — BPS obs will be zeros with dim={self._bps_dim}"
+                )
+            else:
+                logger.warning(f"[BPS] bps_dir not found: {bps_dir} — BPS obs will be zeros")
         self._motion_object_bps = None
         # randomize the upper body poses condition
         self.randomize_upper_body_poses = self.m_cfg.get("cat_upper_body_poses", False)

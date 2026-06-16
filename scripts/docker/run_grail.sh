@@ -5,10 +5,12 @@
 # Usage:
 #   bash scripts/docker/run_grail.sh                   # create & enter (or re-enter)
 #   bash scripts/docker/run_grail.sh --rebuild         # destroy existing and recreate
-#   bash scripts/docker/run_grail.sh -- <cmd> <args>   # exec <cmd> instead of bash
+#   bash scripts/docker/run_grail.sh -- <cmd> <args>   # exec <cmd> instead of /bin/bash
 #
 # Env var overrides:
-#   GRAIL_IMAGE          image tag    (default: docker.io/nvgrail/grail:latest)
+#   GRAIL_IMAGE          image tag    (default: grail-fixed:latest)
+#   GRAIL_BASE_IMAGE     base image   (default: nvidia/cuda:12.8.1-cudnn-devel-ubuntu22.04)
+#   GRAIL_BUILD_FIXED_IMAGE           build default fixed image when missing (default: 1)
 #   GRAIL_CONTAINER      container    (default: grail-sonic)
 #   GRAIL_CACHE_DIR      host cache   (default: ~/.grail-sonic-cache)
 #   GRAIL_HF_CACHE       HF cache     (default: ~/.cache/huggingface)
@@ -30,10 +32,28 @@
 set -eo pipefail
 
 REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
-IMAGE="${GRAIL_IMAGE:-docker.io/nvgrail/grail:latest}"
+DEFAULT_FIXED_IMAGE="grail-fixed:latest"
+BASE_IMAGE="${GRAIL_BASE_IMAGE:-nvidia/cuda:12.8.1-cudnn-devel-ubuntu22.04}"
+IMAGE="${GRAIL_IMAGE:-$DEFAULT_FIXED_IMAGE}"
 NAME="${GRAIL_CONTAINER:-grail-sonic}"
 CACHE_DIR="${GRAIL_CACHE_DIR:-$HOME/.grail-sonic-cache}"
 HF_CACHE="${GRAIL_HF_CACHE:-$HOME/.cache/huggingface}"
+
+ensure_default_image() {
+    FORCE_BUILD="${1:-0}"
+    if [[ -n "${GRAIL_IMAGE:-}" || "${GRAIL_BUILD_FIXED_IMAGE:-1}" == "0" ]]; then
+        return
+    fi
+    if [[ "${FORCE_BUILD}" != "1" ]] && docker image inspect "${IMAGE}" >/dev/null 2>&1; then
+        return
+    fi
+
+    echo ">>> Building default fixed image '${IMAGE}' from '${BASE_IMAGE}'"
+    docker build \
+        --build-arg "GRAIL_BASE_IMAGE=${BASE_IMAGE}" \
+        -t "${IMAGE}" \
+        - < "${REPO_ROOT}/Dockerfile.grail-fixed"
+}
 
 REBUILD=0
 EXEC_ARGS=()
@@ -45,12 +65,20 @@ while [[ $# -gt 0 ]]; do
         *) echo "Unknown arg: $1 (use -- to pass command to container)" >&2; exit 1 ;;
     esac
 done
-[[ ${#EXEC_ARGS[@]} -eq 0 ]] && EXEC_ARGS=("bash")
+if [[ ${#EXEC_ARGS[@]} -eq 0 ]]; then
+    EXEC_ARGS=("/bin/bash")
+elif [[ "${EXEC_ARGS[0]}" == "bash" ]]; then
+    EXEC_ARGS[0]="/bin/bash"
+fi
 
 mkdir -p "${CACHE_DIR}"/{kit,ov,pip,glcache,computecache,logs,data,documents} "${HF_CACHE}"
 
 if [[ -n "${DISPLAY:-}" ]]; then
     xhost +local:root >/dev/null 2>&1 || true
+fi
+
+if [[ "${REBUILD}" -eq 1 ]] || ! docker inspect "${NAME}" >/dev/null 2>&1; then
+    ensure_default_image "${REBUILD}"
 fi
 
 if [[ "${REBUILD}" -eq 1 ]] && docker inspect "${NAME}" >/dev/null 2>&1; then
@@ -65,6 +93,18 @@ if docker inspect "${NAME}" >/dev/null 2>&1; then
         echo ">>> Exec'ing into running container '${NAME}'"
         exec docker exec -it "${NAME}" "${EXEC_ARGS[@]}"
     else
+        STORED_CMD="$(docker inspect --format='{{json .Config.Cmd}}' "${NAME}" 2>/dev/null || true)"
+        STORED_IMAGE="$(docker inspect --format='{{.Config.Image}}' "${NAME}" 2>/dev/null || true)"
+        if [[ "${STORED_CMD}" == *'"/usr/bin/bash"'* || "${STORED_CMD}" == '["bash"]' || ( "${STORED_CMD}" == *'"/bin/bash"'* && "${STORED_IMAGE}" != "${IMAGE}" ) ]]; then
+            cat >&2 <<EOF
+Existing stopped container '${NAME}' was created with an invalid shell command: ${STORED_CMD}
+Container image: ${STORED_IMAGE}
+Docker cannot override a stopped container's original command during 'docker start'.
+Recreate it with:
+  bash scripts/docker/run_grail.sh --rebuild
+EOF
+            exit 1
+        fi
         echo ">>> Starting stopped container '${NAME}'"
         exec docker start -ai "${NAME}"
     fi

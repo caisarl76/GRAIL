@@ -148,6 +148,7 @@ Initialize with:
    recon_4dhoi
    retargeting
    tracking
+   ego_vla_pipeline
 
 .. toctree::
    :maxdepth: 2

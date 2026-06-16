@@ -139,6 +139,15 @@ else
     echo "[Step 3/${TOTAL_STEPS}] Post-processing videos..."
 
     # --- Step 3: ffmpeg labeling + combined/grid videos ---
+    if ! command -v ffmpeg >/dev/null 2>&1; then
+        echo "Error: ffmpeg command not found; raw videos were rendered in: ${VIDEO_DIR}" >&2
+        echo "Install system ffmpeg with:" >&2
+        echo "  apt-get update -qq && apt-get install -y --no-install-recommends ffmpeg" >&2
+        echo "Or rerun the GRAIL installer system-deps step:" >&2
+        echo "  INSTALL_SYSTEM_DEPS=1 bash scripts/setup/install_env_sonic.sh" >&2
+        exit 127
+    fi
+
     COMBINED_VIDEO="${VIDEO_DIR}/all_motions_combined.mp4"
     TEMP_LABELED_DIR="/tmp/vis_labeled_${KEY}"
     mkdir -p "${TEMP_LABELED_DIR}"

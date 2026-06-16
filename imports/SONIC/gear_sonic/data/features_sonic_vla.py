@@ -109,6 +109,11 @@ def get_modality_config_sonic_vla(robot_model: RobotModel) -> dict:
                 "end": 64,
                 "original_key": "action.motion_token",
             },
+            "hand_primitive": {
+                "start": 0,
+                "end": 2,
+                "original_key": "action.hand_primitive",
+            },
             "smpl_joints": {
                 "start": 0,
                 "end": 72,
@@ -265,6 +270,11 @@ def get_features_sonic_vla(robot_model: RobotModel) -> dict:
             "dtype": "float64",
             "shape": (64,),
             "names": "motion_token",
+        },
+        "action.hand_primitive": {
+            "dtype": "float64",
+            "shape": (2,),
+            "names": ["left_hand_primitive", "right_hand_primitive"],
         },
         "teleop.smpl_joints": {
             "dtype": "float32",

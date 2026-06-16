@@ -3,6 +3,7 @@ import json
 import os
 import time
 from datetime import datetime
+from pathlib import Path
 
 from loguru import logger
 import numpy as np
@@ -415,19 +416,35 @@ class ImEvalCallback(TrainerCallback):
         # Debug state logging
         if self._debug_state_records is not None:
             motion_cmd = self.env.env.command_manager.get_term("motion")
-            rec = {
-                "step": actor_state.get("step", len(self._debug_state_records)),
-                "root_pos": motion_cmd.robot_body_pos_w[0, 0].cpu().tolist(),
-                "root_quat": motion_cmd.robot_body_quat_w[0, 0].cpu().tolist(),
-                "ref_root_pos": motion_cmd.body_pos_w[0, 0].cpu().tolist(),
-                "ref_root_quat": motion_cmd.body_quat_w[0, 0].cpu().tolist(),
-                "joint_pos": motion_cmd.robot_joint_pos[0, :29].cpu().tolist(),
-                "ref_joint_pos": motion_cmd.joint_pos[0].cpu().tolist(),
-                "actions": actor_state["actions"][0].cpu().tolist(),
-                "reward": rewards[0].item(),
-                "done": bool(dones[0].item()) if dones.numel() > 0 else False,
-            }
-            self._debug_state_records.append(rec)
+            motion_indices = (self.env.start_idx + self.env.motion_ids).detach().cpu().tolist()
+            motion_keys = getattr(self.env._motion_lib, "_motion_data_keys", [])
+            actions_cpu = actor_state["actions"].detach().cpu()
+            rewards_cpu = rewards.detach().cpu()
+            dones_cpu = dones.detach().cpu()
+            for env_idx in range(actions_cpu.shape[0]):
+                motion_index = int(motion_indices[env_idx])
+                motion_key = (
+                    str(motion_keys[motion_index])
+                    if motion_index < len(motion_keys)
+                    else f"motion_{motion_index}"
+                )
+                rec = {
+                    "step": actor_state.get("step", len(self._debug_state_records)),
+                    "env_index": env_idx,
+                    "motion_index": motion_index,
+                    "motion_key": motion_key,
+                    "frame_index": int(self.curr_steps),
+                    "root_pos": motion_cmd.robot_body_pos_w[env_idx, 0].cpu().tolist(),
+                    "root_quat": motion_cmd.robot_body_quat_w[env_idx, 0].cpu().tolist(),
+                    "ref_root_pos": motion_cmd.body_pos_w[env_idx, 0].cpu().tolist(),
+                    "ref_root_quat": motion_cmd.body_quat_w[env_idx, 0].cpu().tolist(),
+                    "joint_pos": motion_cmd.robot_joint_pos[env_idx, :29].cpu().tolist(),
+                    "ref_joint_pos": motion_cmd.joint_pos[env_idx].cpu().tolist(),
+                    "actions": actions_cpu[env_idx].tolist(),
+                    "reward": rewards_cpu[env_idx].item(),
+                    "done": bool(dones_cpu[env_idx].item()) if dones_cpu.numel() > 0 else False,
+                }
+                self._debug_state_records.append(rec)
         return actor_state
 
     def _pre_eval_env_step(self, actor_state: dict):

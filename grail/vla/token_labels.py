@@ -26,8 +26,8 @@ def validate_motion_tokens(
     """Return SONIC teacher labels as float64 after checking shape and finiteness.
 
     Accepted label widths are:
-    - 64: motion token / latent residual only; hand primitives default to zeros.
-    - 66: full meta-action, split as 64 motion-token dims + 2 hand primitives.
+    - 64: final ATM motion token only; hand primitives default to zeros.
+    - 66: final ATM motion token plus 2 applied hand primitive values.
     """
 
     token_array = np.asarray(tokens, dtype=np.float64)

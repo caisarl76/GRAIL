@@ -79,6 +79,7 @@ class ManagerEnvWrapper:
         self._action_lines = None
         self._action_hist = None
         self._hist_idx = 0
+        self._debug_reference_body_action_step_count = 0
 
         self._blit_background = None
         self._blit_supported = True
@@ -376,6 +377,115 @@ class ManagerEnvWrapper:
 
         return atm_obs_dict
 
+    def _reference_body_action_from_current_command(self, env_actions):
+        """Return normalized body action that targets the current reference joint pose."""
+        body_indices = getattr(self, "_body_joint_indices", None)
+        if (
+            self.motion_command is None
+            or body_indices is None
+            or len(body_indices) == 0
+        ):
+            return None, None
+
+        try:
+            action_term = self.env.action_manager.get_term("joint_pos")
+            offset = getattr(action_term, "_offset", None)
+            scale = getattr(action_term, "_scale", None)
+        except (AttributeError, KeyError, RuntimeError, ValueError):
+            return None, None
+        if offset is None or scale is None:
+            return None, None
+
+        if not isinstance(body_indices, torch.Tensor):
+            body_indices = torch.as_tensor(body_indices, dtype=torch.long, device=self.device)
+        else:
+            body_indices = body_indices.to(device=self.device, dtype=torch.long)
+
+        num_envs = env_actions.shape[0]
+        dtype = env_actions.dtype
+        offset = offset.to(device=self.device, dtype=dtype)
+        scale = scale.to(device=self.device, dtype=dtype)
+        if offset.dim() == 1:
+            offset_body = offset[body_indices].unsqueeze(0).expand(num_envs, -1)
+        else:
+            offset_body = offset[:, body_indices]
+        if scale.dim() == 1:
+            scale_body = scale[body_indices].unsqueeze(0).expand(num_envs, -1)
+        else:
+            scale_body = scale[:, body_indices]
+
+        ref_joint_pos = self.motion_command.joint_pos.to(device=self.device, dtype=dtype)
+        ref_body_target = ref_joint_pos[:, : body_indices.numel()]
+        if ref_body_target.shape != offset_body.shape:
+            return None, None
+
+        safe_scale = torch.where(
+            scale_body.abs() > 1.0e-8,
+            scale_body,
+            torch.ones_like(scale_body),
+        )
+        return (ref_body_target - offset_body) / safe_scale, ref_body_target
+
+    def _motion_body_action_from_current_command(self, env_actions):
+        """Return body action labels stored in the motion file, if available."""
+        if self.motion_command is None or self._motion_lib is None:
+            return None, None
+        if not getattr(self._motion_lib, "has_action", False) or not hasattr(
+            self._motion_lib, "_motion_actions"
+        ):
+            return None, None
+
+        body_indices = getattr(self, "_body_joint_indices", None)
+        if body_indices is not None and not isinstance(body_indices, torch.Tensor):
+            body_indices = torch.as_tensor(body_indices, dtype=torch.long, device=self.device)
+        elif isinstance(body_indices, torch.Tensor):
+            body_indices = body_indices.to(device=self.device, dtype=torch.long)
+
+        motion_steps = self.motion_command.motion_start_time_steps + self.motion_command.time_steps
+        motion_action = self._motion_lib.get_motion_actions(
+            self.motion_command.motion_ids,
+            motion_steps,
+        ).to(device=self.device, dtype=env_actions.dtype)
+
+        if motion_action.shape[-1] == env_actions.shape[-1]:
+            if body_indices is not None and len(body_indices) > 0:
+                body_action = motion_action[:, body_indices]
+            else:
+                body_action = motion_action
+        elif body_indices is not None and motion_action.shape[-1] == len(body_indices):
+            body_action = motion_action
+        elif motion_action.shape[-1] <= env_actions.shape[-1]:
+            body_action = motion_action
+        else:
+            return None, None
+
+        try:
+            action_term = self.env.action_manager.get_term("joint_pos")
+            offset = getattr(action_term, "_offset", None)
+            scale = getattr(action_term, "_scale", None)
+        except (AttributeError, KeyError, RuntimeError, ValueError):
+            return body_action, None
+        if offset is None or scale is None:
+            return body_action, None
+
+        offset = offset.to(device=self.device, dtype=env_actions.dtype)
+        scale = scale.to(device=self.device, dtype=env_actions.dtype)
+        if body_indices is not None and len(body_indices) > 0:
+            if offset.dim() == 1:
+                offset_body = offset[body_indices].unsqueeze(0).expand(body_action.shape[0], -1)
+            else:
+                offset_body = offset[:, body_indices]
+            if scale.dim() == 1:
+                scale_body = scale[body_indices].unsqueeze(0).expand(body_action.shape[0], -1)
+            else:
+                scale_body = scale[:, body_indices]
+        else:
+            offset_body = offset
+            scale_body = scale
+        if offset_body.shape != body_action.shape or scale_body.shape != body_action.shape:
+            return body_action, None
+        return body_action, body_action * scale_body + offset_body
+
     def reset_all(self, global_rank=0):  # noqa: ARG002
         return self.reset()
 
@@ -562,6 +672,7 @@ class ManagerEnvWrapper:
     def reset(self, flatten_dict_obs=True):
         obs, info = self.env.reset()
         new_obs = self.process_raw_obs(obs, flatten_dict_obs)
+        self._debug_reference_body_action_step_count = 0
         # Initialize success_lift to False for all envs after reset (used unconditionally in step())
         self.env.success_lift = torch.zeros(
             self.env.num_envs, dtype=torch.bool, device=self.env.device
@@ -569,6 +680,8 @@ class ManagerEnvWrapper:
         if self.action_transform_module is not None:
             # Store obs for action_transform_module when obs_dict is not provided in step()
             self._last_obs_dict = new_obs
+            if hasattr(self.action_transform_module, "reset"):
+                self.action_transform_module.reset()
             # Initialize last meta action buffer (policy output: latent + primitives)
             # meta_action_dim = tokenizer_action_dim + hand_action_dim (e.g., 64 + 2 = 66)
             meta_action_dim = self.config.get("meta_action_dim", 66)
@@ -811,6 +924,14 @@ class ManagerEnvWrapper:
         return body_actions
 
     def step(self, actions):
+        applied_motion_token = None
+        applied_hand_primitive = None
+        zero_residual_body_actions = None
+        zero_residual_motion_token = None
+        forced_reference_body_action = None
+        forced_reference_body_joint_target = None
+        forced_motion_body_action = None
+        forced_motion_body_joint_target = None
         if self.action_transform_module is not None:
             # Use provided obs_dict or fall back to stored obs from last reset/step
             if "obs_dict" in actions:
@@ -874,6 +995,8 @@ class ManagerEnvWrapper:
             else:
                 self.env._finger_primitive_actions_raw = None  # noqa: SLF001
                 hand_actions = hand_actions_raw
+            if hand_actions_raw.shape[-1] == 2:
+                applied_hand_primitive = hand_actions_raw.detach().clone()
 
             if action_mode == "direct_latent":
                 # Student direct latent mode: policy outputs FULL latent, not residual
@@ -890,6 +1013,22 @@ class ManagerEnvWrapper:
                     latent_residual=scaled_residual,
                     latent_residual_mode=self._latent_residual_mode,
                 )
+                if self.config.get("debug_zero_residual_action", False):
+                    atm_module = self.action_transform_module.actor_module
+                    actor_full_latent = getattr(atm_module, "_last_full_latent_flat", None)
+                    if isinstance(actor_full_latent, torch.Tensor):
+                        actor_full_latent = actor_full_latent.detach().clone()
+                    with torch.no_grad():
+                        zero_residual_body_actions = self.action_transform_module(
+                            atm_obs_dict,
+                            latent_residual=torch.zeros_like(scaled_residual),
+                            latent_residual_mode=self._latent_residual_mode,
+                        )
+                        zero_full_latent = getattr(atm_module, "_last_full_latent_flat", None)
+                        if isinstance(zero_full_latent, torch.Tensor):
+                            zero_residual_motion_token = zero_full_latent.detach().clone()
+                    if isinstance(actor_full_latent, torch.Tensor):
+                        atm_module._last_full_latent_flat = actor_full_latent  # noqa: SLF001
 
             elif action_mode == "mixed":
                 # Mixed rollout: some envs use teacher (residual), some use student (direct_latent)
@@ -993,8 +1132,13 @@ class ManagerEnvWrapper:
                     if fl.dim() == 3:
                         fl = fl[:, -1, :]  # (batch, latent_dim)
                     self.env._full_latent = fl.to(self.env.device)  # noqa: SLF001
+                    applied_motion_token = self.env._full_latent.detach().clone()  # noqa: SLF001
 
             body_actions = body_actions[:, -1]  # Take last timestep
+            if zero_residual_body_actions is not None and zero_residual_body_actions.dim() == 3:
+                zero_residual_body_actions = zero_residual_body_actions[:, -1]
+            if zero_residual_motion_token is not None and zero_residual_motion_token.dim() == 3:
+                zero_residual_motion_token = zero_residual_motion_token[:, -1]
 
             if (
                 self._body_joint_indices is not None
@@ -1014,10 +1158,58 @@ class ManagerEnvWrapper:
         else:
             env_actions = actions["actions"]
 
+        force_ref_steps = int(self.config.get("debug_force_reference_body_action_steps", 0))
+        body_joint_indices = getattr(self, "_body_joint_indices", None)
+        if (
+            self.is_evaluating
+            and force_ref_steps > self._debug_reference_body_action_step_count
+            and body_joint_indices is not None
+            and len(body_joint_indices) > 0
+        ):
+            reference_action, reference_target = self._reference_body_action_from_current_command(
+                env_actions
+            )
+            if reference_action is not None and reference_target is not None:
+                env_actions[:, body_joint_indices] = reference_action
+                forced_reference_body_action = reference_action.detach().clone()
+                forced_reference_body_joint_target = reference_target.detach().clone()
+            else:
+                logger.warning(
+                    "debug_force_reference_body_action_steps requested, but reference action "
+                    "could not be computed for this step"
+                )
+        force_motion_steps = int(self.config.get("debug_force_motion_body_action_steps", 0))
+        if (
+            self.is_evaluating
+            and force_motion_steps > self._debug_reference_body_action_step_count
+            and body_joint_indices is not None
+            and len(body_joint_indices) > 0
+        ):
+            motion_action, motion_target = self._motion_body_action_from_current_command(
+                env_actions
+            )
+            if motion_action is not None:
+                env_actions[:, body_joint_indices] = motion_action
+                forced_motion_body_action = motion_action.detach().clone()
+                if motion_target is not None:
+                    forced_motion_body_joint_target = motion_target.detach().clone()
+            else:
+                logger.warning(
+                    "debug_force_motion_body_action_steps requested, but motion-file action "
+                    "labels were not available for this step"
+                )
+        self._debug_reference_body_action_step_count += 1
+
         action_clip_value = self.config.get("action_clip_value", None)
 
         if action_clip_value is not None and action_clip_value > 0:
             env_actions = torch.clip(env_actions, -action_clip_value, action_clip_value)
+            if forced_reference_body_action is not None and body_joint_indices is not None:
+                forced_reference_body_action = env_actions[:, body_joint_indices].detach().clone()
+                forced_reference_body_joint_target = None
+            if forced_motion_body_action is not None and body_joint_indices is not None:
+                forced_motion_body_action = env_actions[:, body_joint_indices].detach().clone()
+                forced_motion_body_joint_target = None
 
         # Lightweight action plot update (env 0, first N joints)
         if self.turn_on_visualization:
@@ -1100,6 +1292,18 @@ class ManagerEnvWrapper:
         extras["time_outs"] = truncated
         extras["episode"] = {}
         extras["to_log"] = {}
+        for debug_key in (
+            "env_actions",
+            "motion_token",
+            "hand_primitive",
+            "zero_residual_body_actions",
+            "zero_residual_motion_token",
+            "forced_reference_body_action",
+            "forced_reference_body_joint_target",
+            "forced_motion_body_action",
+            "forced_motion_body_joint_target",
+        ):
+            extras.pop(debug_key, None)
         for k, v in extras["log"].items():
             if isinstance(v, torch.Tensor):
                 extras["to_log"][k] = v
@@ -1159,6 +1363,26 @@ class ManagerEnvWrapper:
         self.extras = extras
         # Store env_actions for callbacks (e.g., MultiLatentSaveCallback)
         extras["env_actions"] = env_actions.detach().cpu()
+        if applied_motion_token is not None:
+            extras["motion_token"] = applied_motion_token.detach().cpu()
+        if applied_hand_primitive is not None:
+            extras["hand_primitive"] = applied_hand_primitive.detach().cpu()
+        if zero_residual_body_actions is not None:
+            extras["zero_residual_body_actions"] = zero_residual_body_actions.detach().cpu()
+        if zero_residual_motion_token is not None:
+            extras["zero_residual_motion_token"] = zero_residual_motion_token.detach().cpu()
+        if forced_reference_body_action is not None:
+            extras["forced_reference_body_action"] = forced_reference_body_action.detach().cpu()
+        if forced_reference_body_joint_target is not None:
+            extras["forced_reference_body_joint_target"] = (
+                forced_reference_body_joint_target.detach().cpu()
+            )
+        if forced_motion_body_action is not None:
+            extras["forced_motion_body_action"] = forced_motion_body_action.detach().cpu()
+        if forced_motion_body_joint_target is not None:
+            extras["forced_motion_body_joint_target"] = (
+                forced_motion_body_joint_target.detach().cpu()
+            )
         return new_obs, rew, dones, extras
 
     def get_env_data(self, key):

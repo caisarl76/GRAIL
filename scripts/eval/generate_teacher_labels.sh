@@ -4,7 +4,8 @@ set -euo pipefail
 # Batched stage-1 teacher-label generation for the GRAIL -> LeRobot distillation
 # dataset. For each motion shard (rank), this runs one IsaacLab eval that labels
 # --num-envs motions per launch (with early terminations disabled so every motion
-# rolls to its own time-out), then exports per-motion 66-D SONIC teacher labels.
+# rolls to its own time-out), then exports per-motion 66-D SONIC teacher labels:
+# 64-D final ATM motion token plus 2-D applied hand primitive.
 #
 # The eval rollout is delegated to scripts/eval/test_sonic_pnp_checkpoint.sh so the
 # Hydra overrides stay defined in one place. Export uses --truncate-at-done so a
@@ -24,6 +25,9 @@ Options:
   --output-root PATH            Root for per-rank eval output (token_debug.json, metrics).
                                 Each rank writes <output-root>/rank_XXXX/<task>/.
   --label-root PATH             Output directory for <motion_key>.npy teacher labels.
+  --motion-keys-file PATH       Optional exact motion-key list to label. The list is
+                                split across ranks before eval, avoiding implicit full-lib
+                                shard selection.
   --gpu ID                      CUDA_VISIBLE_DEVICES for the eval process.
   --num-envs N                  Motions labeled per Isaac launch (one batch). Default: 16.
                                 Per-object USD collision meshes are static, so a single
@@ -37,10 +41,12 @@ Options:
   --shard-end N                 One past the last rank to run (exclusive). Default: --num-shards.
   --skip-existing               Skip ranks that already wrote a .teacher_labels.done marker.
   --dry-run                     Print per-rank eval + export commands without running.
+  +foo=bar, ++foo=bar, ~foo=bar,
+  hydra.foo=bar                 Extra Hydra overrides passed through to eval.
   -h, --help                    Show this help.
 
 Outputs:
-  <label-root>/<motion_key>.npy            (frames, 66) teacher labels
+  <label-root>/<motion_key>.npy            (frames, 66) [motion_token, hand_primitive]
   <output-root>/rank_XXXX/<task>/token_debug.json
   <output-root>/rank_XXXX/<task>/.teacher_labels.done   (success marker)
 EOF
@@ -54,6 +60,7 @@ DATA_DIR=""
 BPS_DIR=""
 OUTPUT_ROOT=""
 LABEL_ROOT=""
+MOTION_KEYS_FILE=""
 GPU_ID=""
 NUM_ENVS="16"
 NUM_SHARDS=""
@@ -61,6 +68,7 @@ SHARD_START="0"
 SHARD_END=""
 SKIP_EXISTING="0"
 DRY_RUN="0"
+EXTRA_OVERRIDES=()
 
 while [[ $# -gt 0 ]]; do
     case "$1" in
@@ -69,6 +77,7 @@ while [[ $# -gt 0 ]]; do
         --bps-dir) BPS_DIR="$2"; shift 2 ;;
         --output-root) OUTPUT_ROOT="$2"; shift 2 ;;
         --label-root) LABEL_ROOT="$2"; shift 2 ;;
+        --motion-keys-file) MOTION_KEYS_FILE="$2"; shift 2 ;;
         --gpu) GPU_ID="$2"; shift 2 ;;
         --num-envs) NUM_ENVS="$2"; shift 2 ;;
         --num-shards) NUM_SHARDS="$2"; shift 2 ;;
@@ -77,6 +86,7 @@ while [[ $# -gt 0 ]]; do
         --skip-existing) SKIP_EXISTING="1"; shift ;;
         --dry-run) DRY_RUN="1"; shift ;;
         -h|--help) usage; exit 0 ;;
+        +*|~*|hydra.*) EXTRA_OVERRIDES+=("$1"); shift ;;
         *) echo "Unknown argument: $1" >&2; usage >&2; exit 2 ;;
     esac
 done
@@ -96,12 +106,22 @@ if [[ -z "$OUTPUT_ROOT" ]]; then
     fi
 fi
 
-# Per-object USD collision meshes are assigned once at scene creation, so each eval
-# process may only run a single batch: motions-per-shard must be <= num_envs. Derive
-# world_size from the motion count to guarantee one batch per shard.
-NUM_MOTIONS="$(find "$DATA_DIR/robot" -maxdepth 1 -name '*.pkl' | wc -l)"
+if [[ -n "$MOTION_KEYS_FILE" ]]; then
+    if [[ ! -f "$MOTION_KEYS_FILE" ]]; then
+        echo "Motion keys file not found: $MOTION_KEYS_FILE" >&2
+        exit 2
+    fi
+    mapfile -t REQUESTED_MOTION_KEYS < <(grep -v '^[[:space:]]*$' "$MOTION_KEYS_FILE")
+    NUM_MOTIONS="${#REQUESTED_MOTION_KEYS[@]}"
+else
+    REQUESTED_MOTION_KEYS=()
+    # Per-object USD collision meshes are assigned once at scene creation, so each eval
+    # process may only run a single batch: motions-per-shard must be <= num_envs. Derive
+    # world_size from the motion count to guarantee one batch per shard.
+    NUM_MOTIONS="$(find "$DATA_DIR/robot" -maxdepth 1 -name '*.pkl' | wc -l)"
+fi
 if [[ "$NUM_MOTIONS" -eq 0 ]]; then
-    echo "No motions found under $DATA_DIR/robot/*.pkl" >&2
+    echo "No motions found to label" >&2
     exit 2
 fi
 
@@ -127,6 +147,22 @@ for rank in $(seq "$SHARD_START" $(("$SHARD_END" - 1))); do
     rank_out="${OUTPUT_ROOT}/rank_${pad}"
     debug_log="${rank_out}/${TASK}/token_debug.json"
     done_marker="${rank_out}/${TASK}/.teacher_labels.done"
+    rank_keys_file=""
+
+    if [[ -n "$MOTION_KEYS_FILE" ]]; then
+        rank_keys_file="${rank_out}/${TASK}/motion_keys.txt"
+        start=$(((rank * NUM_MOTIONS) / NUM_SHARDS))
+        end=$((((rank + 1) * NUM_MOTIONS) / NUM_SHARDS))
+        if [[ "$end" -le "$start" ]]; then
+            echo "[skip] rank ${rank}: empty motion-key slice"
+            continue
+        fi
+        mkdir -p "$(dirname "$rank_keys_file")"
+        : > "$rank_keys_file"
+        for ((idx = start; idx < end; idx++)); do
+            printf '%s\n' "${REQUESTED_MOTION_KEYS[$idx]}" >> "$rank_keys_file"
+        done
+    fi
 
     if [[ "$SKIP_EXISTING" == "1" && -f "$done_marker" ]]; then
         echo "[skip] rank ${rank}: ${done_marker} exists"
@@ -142,12 +178,23 @@ for rank in $(seq "$SHARD_START" $(("$SHARD_END" - 1))); do
         --output-root "$rank_out"
         --num-envs "$NUM_ENVS"
         --max-unique-motions all
-        --motion-shard-world-size "$NUM_SHARDS"
-        --motion-shard-rank "$rank"
         --disable-early-terminations
     )
+    if [[ -n "$rank_keys_file" ]]; then
+        eval_cmd+=(
+            --motion-keys-file "$rank_keys_file"
+            --motion-shard-world-size 1
+            --motion-shard-rank 0
+        )
+    else
+        eval_cmd+=(
+            --motion-shard-world-size "$NUM_SHARDS"
+            --motion-shard-rank "$rank"
+        )
+    fi
     [[ -n "$BPS_DIR" ]] && eval_cmd+=(--bps-dir "$BPS_DIR")
     [[ -n "$GPU_ID" ]] && eval_cmd+=(--gpu "$GPU_ID")
+    [[ ${#EXTRA_OVERRIDES[@]} -gt 0 ]] && eval_cmd+=("${EXTRA_OVERRIDES[@]}")
     [[ "$DRY_RUN" == "1" ]] && eval_cmd+=(--dry-run)
 
     export_cmd=(

@@ -110,6 +110,90 @@ def test_generate_teacher_labels_respects_shard_range(tmp_path: Path):
     assert "motion_shard_rank=1" not in out
 
 
+def test_generate_teacher_labels_passes_extra_hydra_overrides(tmp_path: Path):
+    motion_lib = _make_motion_lib(tmp_path, num_motions=4)
+
+    result = _run_dry(
+        [
+            "--task",
+            "pnp_ground",
+            "--data-dir",
+            str(motion_lib),
+            "--output-root",
+            str(tmp_path / "shards"),
+            "--label-root",
+            str(tmp_path / "labels"),
+            "--num-envs",
+            "4",
+            "++manager_env.commands.motion.object_init_z_offset=-0.13",
+        ]
+    )
+
+    assert result.returncode == 0, result.stderr
+    assert "++manager_env.commands.motion.object_init_z_offset=-0.13" in result.stdout
+
+
+def test_generate_teacher_labels_splits_explicit_motion_keys_by_rank(tmp_path: Path):
+    motion_lib = _make_motion_lib(tmp_path, num_motions=6)
+    keys_file = tmp_path / "requested_motion_keys.txt"
+    keys_file.write_text(
+        "\n".join(
+            [
+                "pickup_ground__obj_000__000",
+                "pickup_ground__obj_001__000",
+                "pickup_ground__obj_002__000",
+                "pickup_ground__obj_003__000",
+                "pickup_ground__obj_004__000",
+            ]
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+    output_root = tmp_path / "shards"
+
+    result = _run_dry(
+        [
+            "--task",
+            "pnp_ground",
+            "--data-dir",
+            str(motion_lib),
+            "--output-root",
+            str(output_root),
+            "--label-root",
+            str(tmp_path / "labels"),
+            "--motion-keys-file",
+            str(keys_file),
+            "--num-envs",
+            "2",
+        ]
+    )
+
+    assert result.returncode == 0, result.stderr
+    out = result.stdout
+    assert "[plan] 5 motions, 2 envs -> 3 shards" in out
+    assert "++manager_env.config.per_rank_motion_keys_file=" in out
+    assert "++manager_env.commands.motion.motion_lib_cfg.motion_shard_world_size=1" in out
+    assert "++manager_env.commands.motion.motion_lib_cfg.filter_motion_keys=" in out
+
+    assert (
+        output_root / "rank_0000" / "pnp_ground" / "motion_keys.txt"
+    ).read_text(encoding="utf-8").splitlines() == [
+        "pickup_ground__obj_000__000",
+    ]
+    assert (
+        output_root / "rank_0001" / "pnp_ground" / "motion_keys.txt"
+    ).read_text(encoding="utf-8").splitlines() == [
+        "pickup_ground__obj_001__000",
+        "pickup_ground__obj_002__000",
+    ]
+    assert (
+        output_root / "rank_0002" / "pnp_ground" / "motion_keys.txt"
+    ).read_text(encoding="utf-8").splitlines() == [
+        "pickup_ground__obj_003__000",
+        "pickup_ground__obj_004__000",
+    ]
+
+
 def test_generate_teacher_labels_rejects_oversubscribed_shard_override(tmp_path: Path):
     # 40 motions / 2 shards = 20 motions per shard > 4 envs => multi-batch, must be refused.
     motion_lib = _make_motion_lib(tmp_path, num_motions=40)

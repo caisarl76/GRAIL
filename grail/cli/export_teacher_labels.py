@@ -37,6 +37,43 @@ def _record_actions(record: dict) -> np.ndarray:
     return actions
 
 
+def _record_motion_token(record: dict) -> np.ndarray:
+    token = np.asarray(record.get("motion_token"), dtype=np.float64).reshape(-1)
+    if token.shape != (MOTION_TOKEN_DIM,):
+        raise ValueError(
+            f"teacher record must include final motion_token with shape ({MOTION_TOKEN_DIM},), "
+            f"got {token.shape}"
+        )
+    if not np.all(np.isfinite(token)):
+        raise ValueError("teacher motion_token contains non-finite values")
+    return token
+
+
+def _record_hand_primitive(record: dict) -> np.ndarray:
+    if "hand_primitive" in record:
+        hand = np.asarray(record["hand_primitive"], dtype=np.float64).reshape(-1)
+    else:
+        hand = _record_actions(record)[MOTION_TOKEN_DIM:]
+    if hand.shape != (HAND_PRIMITIVE_DIM,):
+        raise ValueError(
+            f"teacher hand primitive must have shape ({HAND_PRIMITIVE_DIM},), got {hand.shape}"
+        )
+    if not np.all(np.isfinite(hand)):
+        raise ValueError("teacher hand primitive contains non-finite values")
+    return hand
+
+
+def _record_label(record: dict, *, allow_residual_actions: bool = False) -> np.ndarray:
+    if "motion_token" not in record:
+        if allow_residual_actions:
+            return _record_actions(record)
+        raise ValueError(
+            "teacher record is missing final motion_token; token_debug actions[:64] are latent "
+            "residuals, not distillation motion-token labels"
+        )
+    return np.concatenate([_record_motion_token(record), _record_hand_primitive(record)], axis=0)
+
+
 def _load_debug_records(debug_log: Path) -> list[dict]:
     records = json.loads(debug_log.read_text(encoding="utf-8"))
     if not isinstance(records, list):
@@ -80,8 +117,9 @@ def export_teacher_labels(
     truncate_at_done: bool = False,
     skip_unknown_motions: bool = False,
     dedupe_overflow_envs: bool = False,
+    allow_residual_actions: bool = False,
 ) -> int:
-    """Convert SONIC teacher debug records into per-motion 66-D label arrays."""
+    """Convert SONIC teacher debug records into per-motion final-token label arrays."""
 
     debug_path = Path(debug_log)
     output_path = Path(output)
@@ -102,7 +140,10 @@ def export_teacher_labels(
             if dedupe_overflow_envs:
                 continue
             raise ValueError(f"duplicate frame_index {frame_index} for {motion_key}")
-        grouped[motion_key][frame_index] = _record_actions(record)
+        grouped[motion_key][frame_index] = _record_label(
+            record,
+            allow_residual_actions=allow_residual_actions,
+        )
         done_flags[motion_key][frame_index] = bool(record.get("done", False))
 
     if not grouped:
@@ -156,7 +197,10 @@ def export_teacher_labels(
 
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
-        description="Export per-motion 66-D SONIC teacher labels from token_debug.json records."
+        description=(
+            "Export per-motion 66-D SONIC teacher labels from token_debug.json records. "
+            "Labels are final 64-D motion_token plus 2-D hand primitive."
+        )
     )
     parser.add_argument("--debug-log", required=True, help="SONIC debug JSON from eval callback")
     parser.add_argument("--output", required=True, help="Output directory for <motion_key>.npy labels")
@@ -196,6 +240,15 @@ def build_parser() -> argparse.ArgumentParser:
             "existing motion when num_envs exceeds the motions in a shard. Keeps the first env."
         ),
     )
+    parser.add_argument(
+        "--allow-residual-actions",
+        action="store_true",
+        help=(
+            "Legacy compatibility only: export raw actions[:64] when debug records lack "
+            "motion_token. New distillation labels should not use this because actions[:64] "
+            "are latent residuals."
+        ),
+    )
     parser.add_argument("--overwrite", action="store_true", help="Replace existing label files")
     return parser
 
@@ -211,6 +264,7 @@ def main(argv: Optional[list[str]] = None) -> int:
         truncate_at_done=args.truncate_at_done,
         skip_unknown_motions=args.skip_unknown_motions,
         dedupe_overflow_envs=args.dedupe_overflow_envs,
+        allow_residual_actions=args.allow_residual_actions,
     )
     print(f"Exported teacher labels: {exported}")
     return 0

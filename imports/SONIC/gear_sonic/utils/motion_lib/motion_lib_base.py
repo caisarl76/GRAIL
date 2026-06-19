@@ -68,6 +68,35 @@ def to_torch(tensor):
         return torch.from_numpy(tensor)
 
 
+def _apply_raw_dof_to_static_pose_aa(
+    pose_aa,
+    raw_dof,
+    dof_axis,
+    static_tol=1e-8,
+):
+    """Fill root-only/static robot pose labels from raw 1-DOF joint angles."""
+    if raw_dof is None or dof_axis is None:
+        return pose_aa, False
+    if pose_aa.ndim != 3 or raw_dof.ndim != 2:
+        return pose_aa, False
+    if pose_aa.shape[0] != raw_dof.shape[0] or pose_aa.shape[1] <= 1:
+        return pose_aa, False
+
+    num_dof = min(raw_dof.shape[-1], pose_aa.shape[1] - 1, dof_axis.shape[0])
+    if num_dof <= 0:
+        return pose_aa, False
+
+    pose_body = pose_aa[:, 1 : 1 + num_dof]
+    if pose_body.abs().max() > static_tol:
+        return pose_aa, False
+
+    axis = dof_axis[:num_dof].to(device=pose_aa.device, dtype=pose_aa.dtype)
+    body_dof = raw_dof[:, :num_dof].to(device=pose_aa.device, dtype=pose_aa.dtype)
+    pose_aa = pose_aa.clone()
+    pose_aa[:, 1 : 1 + num_dof] = body_dof.unsqueeze(-1) * axis.unsqueeze(0)
+    return pose_aa, True
+
+
 def is_navigation_motion(motion_key):
     return (
         motion_key.startswith("2025")
@@ -1921,6 +1950,9 @@ class MotionLibBase:
 
             trans = to_torch(curr_file["root_trans_offset"]).clone()[start:end]
             pose_aa = to_torch(curr_file["pose_aa"][start:end]).clone()
+            raw_dof = None
+            if "dof" in curr_file:
+                raw_dof = to_torch(curr_file["dof"]).clone()[start:end]
 
             # import ipdb; ipdb.set_trace()
             if "action" in curr_file.keys():  # noqa: SIM118
@@ -1945,6 +1977,8 @@ class MotionLibBase:
                     # Repeat the frozen frame for all subsequent frames
                     pose_aa[freeze_idx:] = pose_aa[freeze_idx : freeze_idx + 1].clone()
                     trans[freeze_idx:] = trans[freeze_idx : freeze_idx + 1].clone()
+                    if raw_dof is not None:
+                        raw_dof[freeze_idx:] = raw_dof[freeze_idx : freeze_idx + 1].clone()
 
             if not is_evaluation and self.m_cfg.get("randomize_heading", False):
                 # ZL: this randomization is not combatiable with SMPL
@@ -1961,6 +1995,39 @@ class MotionLibBase:
                     trans, torch.from_numpy(random_heading_rot.as_matrix().T).float()
                 )
                 pose_aa = pose_aa.reshape(B, J, N)
+
+            if self.mesh_parsers is not None:
+                pose_aa, _ = _apply_raw_dof_to_static_pose_aa(
+                    pose_aa,
+                    raw_dof,
+                    self.mesh_parsers.dof_axis,
+                )
+                if raw_dof is not None and not torch.isfinite(pose_aa).all():
+                    # Keep loader robust to malformed data in released datasets.
+                    pose_aa = torch.nan_to_num(pose_aa)
+
+                # Some released GRAIL assets keep `pose_aa` joints zero while
+                # raw `dof` contains motion. If `_apply_raw_dof_to_static_pose_aa`
+                # does not repair (e.g., tiny non-zero noise in pose_aa), recover
+                # using raw dof directly when the signal is clearly dynamic.
+                num_body_dof = min(
+                    raw_dof.shape[-1] if raw_dof is not None else 0,
+                    pose_aa.shape[1] - 1,
+                    self.mesh_parsers.dof_axis.shape[0],
+                )
+                if raw_dof is not None and num_body_dof > 0:
+                    raw_body = raw_dof[:, :num_body_dof]
+                    pose_body = pose_aa[:, 1 : 1 + num_body_dof]
+                    raw_body_amp = raw_body.abs().amax().item()
+                    pose_body_amp = pose_body.abs().amax().item()
+                    if raw_body_amp > 1e-4 and pose_body_amp <= 1e-10:
+                        axis = self.mesh_parsers.dof_axis[:num_body_dof].to(
+                            device=pose_aa.device, dtype=pose_aa.dtype
+                        )
+                        pose_aa = pose_aa.clone()
+                        pose_aa[:, 1 : 1 + num_body_dof] = raw_body.to(
+                            pose_aa.device
+                        ).unsqueeze(-1) * axis.unsqueeze(0)
 
             # self.cat_upper_body_poses_prob of the time, randomize the upper body poses and only for the motions are generated kinematically.  # noqa: E501
             randomize_upper_body_poses = (
@@ -2282,8 +2349,7 @@ class MotionLibBase:
 
                 # Extract hand DOFs if motion file has more than 29 DOFs
                 hand_dof_count = self.m_cfg.get("hand_dof_count", 0)
-                if hand_dof_count > 0 and "dof" in curr_file:
-                    raw_dof = to_torch(curr_file["dof"]).clone()[start:end]
+                if hand_dof_count > 0 and raw_dof is not None:
                     if raw_dof.shape[-1] > 29:
                         # Extract hand DOFs (indices 29 onwards) and interpolate to target FPS
                         hand_dof = raw_dof[:, 29 : 29 + hand_dof_count]

@@ -264,11 +264,18 @@ def test_install_env_sonic_restores_runtime_pins_before_verifying_install():
         "'click==8.4.1'",
         "'daqp==0.7.2'",
         "'opencv-python==4.11.0.86'",
+        "'sympy==1.13.3'",
+        "'torch==2.7.0'",
+        "'torchvision==0.22.0'",
         "'torchaudio==2.7.0'",
     ):
         assert requirement in script
     assert "import importlib.metadata as md" in script
     assert '"click": "8.4.1"' in script
+    assert '"sympy": "1.13.3"' in script
+    assert 'md.version("torch")' in script
+    assert 'md.version("torchvision")' in script
+    assert "import torchvision as _torchvision" in script
     assert "pinned packages: OK" in script
     assert "import wandb" in script
     assert "wandb: OK" in script

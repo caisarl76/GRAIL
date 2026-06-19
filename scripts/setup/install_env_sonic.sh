@@ -277,8 +277,15 @@ pip install \
     'psutil==5.9.8' \
     'click==8.4.1' \
     'daqp==0.7.2' \
-    'opencv-python==4.11.0.86'
-pip install --index-url https://download.pytorch.org/whl/cu128 'torchaudio==2.7.0'
+    'opencv-python==4.11.0.86' \
+    'sympy==1.13.3'
+# Keep the PyTorch binary trio ABI-matched. Installing only torchaudio can
+# upgrade torch while leaving torchvision pinned to an older wheel, which makes
+# `import torchvision` fail with missing custom ops such as torchvision::nms.
+pip install --index-url https://download.pytorch.org/whl/cu128 \
+    'torch==2.7.0' \
+    'torchvision==0.22.0' \
+    'torchaudio==2.7.0'
 
 # --- Step 6: git-lfs pull for SONIC assets ------------------------------
 # Mesh STLs + policy ONNX files are LFS-tracked. Without this pull, the
@@ -313,6 +320,7 @@ expected_exact = {
     "click": "8.4.1",
     "daqp": "0.7.2",
     "opencv-python": "4.11.0.86",
+    "sympy": "1.13.3",
 }
 
 for package, expected in expected_exact.items():
@@ -320,9 +328,20 @@ for package, expected in expected_exact.items():
     if actual != expected:
         raise SystemExit(f"{package}=={actual}; expected {expected}")
 
+torch = md.version("torch")
+if torch.split("+", 1)[0] != "2.7.0":
+    raise SystemExit(f"torch=={torch}; expected 2.7.0")
+
+torchvision = md.version("torchvision")
+if torchvision.split("+", 1)[0] != "0.22.0":
+    raise SystemExit(f"torchvision=={torchvision}; expected 0.22.0")
+
 torchaudio = md.version("torchaudio")
 if torchaudio.split("+", 1)[0] != "2.7.0":
     raise SystemExit(f"torchaudio=={torchaudio}; expected 2.7.0")
+
+import torch as _torch  # noqa: F401
+import torchvision as _torchvision  # noqa: F401
 
 print("  pinned packages: OK")
 PY

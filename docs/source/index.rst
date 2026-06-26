@@ -148,6 +148,7 @@ Initialize with:
    recon_4dhoi
    retargeting
    tracking
+   teacher_label_generation
    ego_vla_pipeline
 
 .. toctree::
